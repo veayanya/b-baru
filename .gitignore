@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+data/backups/
+data/backups/
+.env
+.env.local
+.env.*.local
+node_modules/
+
+# Cadangan migrasi antar database
+data/migrations/
+data/local_db.json

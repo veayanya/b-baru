@@ -1,0 +1,24 @@
+# ── Secrets & Environment ────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Node.js ──────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ── Build Output ─────────────────────────────────────────────────
+frontend/dist/
+dist/
+
+# ── OS & Editor ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ── Uploads & Temp ───────────────────────────────────────────────
+uploads/
+*.tmp
+*.log
