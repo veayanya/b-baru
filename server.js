@@ -1448,6 +1448,62 @@ app.get('/api/v1/trash', requireAuth, async (req, res) => {
  }
 });
 
+// ── ENDPOINT: Pulihkan banyak dokumen dari sampah sekaligus (terpilih / semua) ──
+// Satu kali baca + satu kali tulis untuk sampah dan database (lebih ringan daripada N kali restore satuan).
+// Hak akses sama dengan restore satuan: user hanya boleh memulihkan miliknya, Admin & Moderator boleh semua.
+// Database ditulis lebih dulu, baru sampah dikosongkan — kalau langkah kedua gagal, dokumen tidak hilang.
+app.post('/api/v1/trash/bulk-restore', requireAuth, async (req, res) => {
+  try {
+    const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(rawIds.filter(v => typeof v === 'string' || typeof v === 'number').map(String))];
+
+    if (ids.length === 0) return res.status(400).json({ error: 'Tidak ada dokumen yang dipilih untuk dipulihkan.' });
+    if (ids.length > 1000) return res.status(400).json({ error: 'Maksimal 1000 dokumen per pemulihan.' });
+
+    const trash = await readTrashStore();
+    const byId = new Map(trash.map(t => [String(t.id), t]));
+    const restored = [];
+    const forbidden = [];
+    const notFound = [];
+    const items = [];
+
+    for (const id of ids) {
+      const item = byId.get(id);
+      if (!item) { notFound.push(id); continue; }
+      if (req.user.role === 'user' && item.userId && item.userId !== req.user.id) { forbidden.push(id); continue; }
+      restored.push(id);
+      items.push(item);
+    }
+
+    if (restored.length > 0) {
+      const db = await readDb();
+      const existing = new Set(db.rkis.map(r => String(r.id)));
+      const back = items
+        .filter(it => !existing.has(String(it.id)))
+        .map(({ deletedAt, deletedBy, ...rest }) => rest);
+      if (back.length > 0) {
+        db.rkis.unshift(...back);
+        await writeDb(db);
+      }
+
+      const gone = new Set(restored);
+      await setStore(RKA_TRASH_KEY, trash.filter(t => !gone.has(String(t.id))));
+
+      await logActivity({
+        req,
+        action: 'RESTORE_RKA',
+        target: `${restored.length} dokumen`,
+        details: `Pemulihan massal ${restored.length} berkas RKA dari sampah: ${restored.slice(0, 20).join(', ')}${restored.length > 20 ? ` dan ${restored.length - 20} lainnya` : ''}`
+      });
+    }
+
+    res.json({ success: true, restored, forbidden, notFound });
+  } catch (error) {
+    console.error('Error bulk-restoring from trash:', error);
+    res.status(500).json({ error: 'Gagal memulihkan dokumen dari sampah.' });
+  }
+});
+
 // ── ENDPOINT: Pulihkan dokumen dari sampah kembali ke arsip aktif ──
 app.post('/api/v1/trash/:id/restore', requireAuth, async (req, res) => {
  try {
