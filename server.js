@@ -910,6 +910,27 @@ async function moveRkaToTrash(rka, deletedBy) {
  }
 }
 
+// Taruh dokumen hasil pemulihan dari sampah ke arsip aktif. ID dokumen dibuat dari jumlah dokumen
+// di frontend, jadi ID lama bisa terpakai ulang oleh dokumen lain. Bila itu terjadi, dokumen yang
+// dipulihkan diberi ID baru (…-P1, …-P2) supaya tidak menimpa/hilang. Bila dokumen yang sama persis
+// sudah ada, tidak ditambahkan lagi ({ duplicate: true }).
+function placeRestoredRka(db, doc) {
+  const clash = db.rkis.find(r => String(r.id) === String(doc.id));
+  if (!clash) {
+    db.rkis.unshift(doc);
+    return { id: doc.id, renamed: false };
+  }
+  if (clash.tanggalUpload === doc.tanggalUpload && clash.namaDokumen === doc.namaDokumen) {
+    return { id: doc.id, renamed: false, duplicate: true };
+  }
+  const taken = new Set(db.rkis.map(r => String(r.id)));
+  let n = 1;
+  while (taken.has(`${doc.id}-P${n}`)) n++;
+  const id = `${doc.id}-P${n}`;
+  db.rkis.unshift({ ...doc, id });
+  return { id, renamed: true };
+}
+
 // Tandai hasil dari Smart Heuristic Evaluator (bukan AI) agar frontend bisa membedakannya —
 // tombol "Muat Ulang PDF" tidak boleh menimpa hasil AI yang bagus dengan hasil heuristic.
 function markHeuristic(result) {
@@ -1461,33 +1482,39 @@ app.post('/api/v1/trash/bulk-restore', requireAuth, async (req, res) => {
     if (ids.length > 1000) return res.status(400).json({ error: 'Maksimal 1000 dokumen per pemulihan.' });
 
     const trash = await readTrashStore();
-    const byId = new Map(trash.map(t => [String(t.id), t]));
+    const wanted = new Set(ids);
+    const present = new Set(trash.map(t => String(t.id)));
+    const notFound = ids.filter(id => !present.has(id));
     const restored = [];
     const forbidden = [];
-    const notFound = [];
     const items = [];
+    const renamed = [];
 
-    for (const id of ids) {
-      const item = byId.get(id);
-      if (!item) { notFound.push(id); continue; }
-      if (req.user.role === 'user' && item.userId && item.userId !== req.user.id) { forbidden.push(id); continue; }
-      restored.push(id);
-      items.push(item);
+    // Semua entri sampah ber-ID yang diminta ikut dipulihkan (ID ganda pun tidak ada yang tertinggal/hilang).
+    for (const t of trash) {
+      const id = String(t.id);
+      if (!wanted.has(id)) continue;
+      if (req.user.role === 'user' && t.userId && t.userId !== req.user.id) {
+        if (!forbidden.includes(id)) forbidden.push(id);
+        continue;
+      }
+      items.push(t);
+      if (!restored.includes(id)) restored.push(id);
     }
 
-    if (restored.length > 0) {
+    if (items.length > 0) {
       const db = await readDb();
-      const existing = new Set(db.rkis.map(r => String(r.id)));
-      const back = items
-        .filter(it => !existing.has(String(it.id)))
-        .map(({ deletedAt, deletedBy, ...rest }) => rest);
-      if (back.length > 0) {
-        db.rkis.unshift(...back);
-        await writeDb(db);
+      let added = 0;
+      for (const t of [...items].reverse()) { // dibalik agar urutan asli tetap terjaga setelah unshift
+        const { deletedAt, deletedBy, ...doc } = t;
+        const r = placeRestoredRka(db, doc);
+        if (r.renamed) renamed.push({ from: String(doc.id), to: r.id });
+        if (!r.duplicate) added++;
       }
+      if (added > 0) await writeDb(db);
 
-      const gone = new Set(restored);
-      await setStore(RKA_TRASH_KEY, trash.filter(t => !gone.has(String(t.id))));
+      const done = new Set(items);
+      await setStore(RKA_TRASH_KEY, trash.filter(t => !done.has(t)));
 
       await logActivity({
         req,
@@ -1497,7 +1524,7 @@ app.post('/api/v1/trash/bulk-restore', requireAuth, async (req, res) => {
       });
     }
 
-    res.json({ success: true, restored, forbidden, notFound });
+    res.json({ success: true, restored, forbidden, notFound, renamed });
   } catch (error) {
     console.error('Error bulk-restoring from trash:', error);
     res.status(500).json({ error: 'Gagal memulihkan dokumen dari sampah.' });
@@ -1518,13 +1545,15 @@ app.post('/api/v1/trash/:id/restore', requireAuth, async (req, res) => {
  }
 
  const { deletedAt, deletedBy, ...restored } = item;
+
+ // Database ditulis lebih dulu, baru sampah dikosongkan — kalau langkah kedua gagal, dokumen tidak hilang.
+ // Bila ID lama sudah dipakai dokumen lain, dokumen ini dipulihkan dengan ID baru (lihat placeRestoredRka).
+ const db = await readDb();
+ const placed = placeRestoredRka(db, restored);
+ if (!placed.duplicate) await writeDb(db);
+ if (placed.renamed) restored.id = placed.id;
  trash.splice(tIdx, 1);
  await setStore(RKA_TRASH_KEY, trash);
-
- const db = await readDb();
- const stillExists = db.rkis.some(r => String(r.id) === String(id));
- if (!stillExists) db.rkis.unshift(restored);
- await writeDb(db);
 
  await logActivity({
  req,
