@@ -854,6 +854,62 @@ function toPublicRka(rka) {
  return { ...stripRkaRawText(rka), hasSourceText: !!getRkaSourceText(rka) };
 }
 
+// ── Backup versi & sampah (recycle bin) untuk dokumen RKA ──
+// Supaya dokumen yang tidak sengaja terhapus (di panel Admin maupun User)
+// atau tertimpa (lewat "Muat Ulang PDF" / edit manual) tetap bisa dilihat
+// dan dipulihkan. Disimpan lewat getStore/setStore yang sama dengan
+// main_db (Neon Postgres) — BUKAN di disk lokal — supaya tidak ikut hilang
+// saat Render redeploy/restart.
+const RKA_HISTORY_KEY = 'rka_backup_history'; // { [rkaId]: [ {data, savedAt, reason, by} ] }, terbaru duluan
+const RKA_TRASH_KEY = 'rka_trash';            // [ { ...rka, deletedAt, deletedBy } ], terbaru duluan
+const MAX_HISTORY_PER_DOC = 5;                // simpan 5 versi terakhir per dokumen
+const TRASH_RETENTION_DAYS = 30;              // dokumen di sampah otomatis dibersihkan setelah 30 hari
+
+async function readHistoryStore() {
+ const store = await getStore(RKA_HISTORY_KEY);
+ return store && typeof store === 'object' && !Array.isArray(store) ? store : {};
+}
+
+async function readTrashStore() {
+ const store = await getStore(RKA_TRASH_KEY);
+ return Array.isArray(store) ? store : [];
+}
+
+// Simpan snapshot versi sebuah dokumen (dipanggil otomatis setelah upload
+// baru dan sebelum sebuah dokumen ditimpa lewat update/PUT/pulihkan),
+// supaya versi sebelumnya ("versi terdahulu") tetap bisa dilihat/dipulihkan
+// berdampingan dengan versi yang sekarang.
+async function saveRkaSnapshot(rkaId, rkaData, reason, by) {
+ try {
+ const history = await readHistoryStore();
+ if (!history[rkaId]) history[rkaId] = [];
+ history[rkaId].unshift({
+ data: stripRkaRawText(rkaData),
+ savedAt: new Date().toISOString(),
+ reason,
+ by: by || 'system'
+ });
+ history[rkaId] = history[rkaId].slice(0, MAX_HISTORY_PER_DOC);
+ await setStore(RKA_HISTORY_KEY, history);
+ } catch (err) {
+ console.warn('[Backup] Gagal menyimpan snapshot versi dokumen:', err.message);
+ }
+}
+
+// Pindahkan dokumen yang dihapus ke "sampah" alih-alih dihapus permanen,
+// supaya masih bisa dipulihkan kalau tak sengaja terhapus di panel Admin/User.
+async function moveRkaToTrash(rka, deletedBy) {
+ try {
+ const trash = await readTrashStore();
+ trash.unshift({ ...rka, deletedAt: new Date().toISOString(), deletedBy: deletedBy || 'system' });
+ const cutoff = Date.now() - TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+ const pruned = trash.filter(t => new Date(t.deletedAt).getTime() >= cutoff);
+ await setStore(RKA_TRASH_KEY, pruned);
+ } catch (err) {
+ console.warn('[Backup] Gagal memindahkan dokumen ke sampah:', err.message);
+ }
+}
+
 // Tandai hasil dari Smart Heuristic Evaluator (bukan AI) agar frontend bisa membedakannya —
 // tombol "Muat Ulang PDF" tidak boleh menimpa hasil AI yang bagus dengan hasil heuristic.
 function markHeuristic(result) {
@@ -1147,6 +1203,11 @@ app.post('/api/v1/rkis', requireAuth, async (req, res) => {
  db.rkis.unshift(newRka);
  await writeDb(db);
 
+ // Backup otomatis: simpan snapshot versi ini juga, supaya kalau dokumen
+ // ini nanti tak sengaja terhapus/tertimpa, masih ada versi yang bisa
+ // dipulihkan (lihat GET/POST /api/v1/rkis/:id/history).
+ await saveRkaSnapshot(newRka.id, newRka, 'upload', req.user.name || req.user.username);
+
  const docTitle = newRka.namaDokumen || newRka.sub_kegiatan || newRka.opd || 'Dokumen RKA';
  await logActivity({
  req,
@@ -1191,6 +1252,12 @@ app.put('/api/v1/rkis/:id', requireAuth, async (req, res) => {
  delete safeUpdates.hasSourceText; // penanda dihitung server, jangan disimpan
  const incomingText = getRkaSourceText(updates || {}); // mis. Unggah Ulang PDF → teks sumber diperbarui
  if (incomingText) safeUpdates.sourceText = cleanRkaText(incomingText).slice(0, RKA_SOURCE_TEXT_MAX);
+
+ // Backup otomatis: simpan dulu versi SEBELUM ditimpa, supaya versi
+ // terdahulu tetap bisa dilihat/dipulihkan berdampingan dengan versi
+ // yang baru (mis. kalau "Muat Ulang PDF" / edit manual hasilnya salah).
+ await saveRkaSnapshot(id, rka, 'update', req.user.name || req.user.username);
+
  db.rkis[idx] = { ...rka, ...safeUpdates };
  await writeDb(db);
 
@@ -1222,6 +1289,11 @@ app.delete('/api/v1/rkis/:id', requireAuth, async (req, res) => {
  return res.status(403).json({ error: 'Anda tidak memiliki izin menghapus dokumen ini.' });
  }
 
+ // Jangan hapus permanen — pindahkan ke "sampah" dulu, supaya kalau
+ // ini tidak sengaja (baik dari panel Admin maupun panel User), dokumen
+ // masih bisa dipulihkan lewat POST /api/v1/trash/:id/restore.
+ await moveRkaToTrash(rka, req.user.name || req.user.username);
+
  db.rkis.splice(idx, 1);
  await writeDb(db);
 
@@ -1229,7 +1301,7 @@ app.delete('/api/v1/rkis/:id', requireAuth, async (req, res) => {
  req,
  action: 'DELETE_RKA',
  target: id,
- details: `Penghapusan berkas RKA ${id}`
+ details: `Penghapusan berkas RKA ${id} (dipindahkan ke sampah, bisa dipulihkan)`
  });
 
  res.json({ success: true });
@@ -1257,11 +1329,13 @@ app.post('/api/v1/rkis/bulk-delete', requireAuth, async (req, res) => {
  const forbidden = [];
  const notFound = [];
 
+ const deletedDocs = [];
  for (const id of ids) {
  const rka = byId.get(id);
  if (!rka) { notFound.push(id); continue; }
  if (req.user.role === 'user' && rka.userId && rka.userId !== req.user.id) { forbidden.push(id); continue; }
  deleted.push(id);
+ deletedDocs.push(rka);
  }
 
  if (deleted.length > 0) {
@@ -1269,11 +1343,18 @@ app.post('/api/v1/rkis/bulk-delete', requireAuth, async (req, res) => {
  db.rkis = db.rkis.filter(r => !gone.has(String(r.id)));
  await writeDb(db);
 
+ // Sama seperti hapus satuan: pindahkan semua dokumen ke "sampah" dulu
+ // (bukan dihapus permanen), supaya penghapusan massal yang tidak
+ // sengaja tetap bisa dipulihkan.
+ for (const doc of deletedDocs) {
+ await moveRkaToTrash(doc, req.user.name || req.user.username);
+ }
+
  await logActivity({
  req,
  action: 'DELETE_RKA',
  target: `${deleted.length} dokumen`,
- details: `Penghapusan massal ${deleted.length} berkas RKA: ${deleted.slice(0, 20).join(', ')}${deleted.length > 20 ? ` dan ${deleted.length - 20} lainnya` : ''}`
+ details: `Penghapusan massal ${deleted.length} berkas RKA (dipindahkan ke sampah, bisa dipulihkan): ${deleted.slice(0, 20).join(', ')}${deleted.length > 20 ? ` dan ${deleted.length - 20} lainnya` : ''}`
  });
  }
 
@@ -1281,6 +1362,144 @@ app.post('/api/v1/rkis/bulk-delete', requireAuth, async (req, res) => {
  } catch (error) {
  console.error('Error bulk-deleting RKA:', error);
  res.status(500).json({ error: 'Gagal menghapus dokumen RKA' });
+ }
+});
+
+// ── ENDPOINT: Riwayat versi sebuah dokumen RKA (backup otomatis) ──
+// Sampai 5 versi terakhir sebelum dokumen ini diunggah ulang/diedit,
+// supaya versi terdahulu & versi sekarang bisa dibandingkan/dipulihkan.
+app.get('/api/v1/rkis/:id/history', requireAuth, async (req, res) => {
+ try {
+ const db = await readDb();
+ const rka = db.rkis.find(r => String(r.id) === String(req.params.id));
+ if (rka && req.user.role === 'user' && rka.userId && rka.userId !== req.user.id) {
+ return res.status(403).json({ error: 'Anda tidak memiliki izin melihat riwayat dokumen ini.' });
+ }
+ const history = await readHistoryStore();
+ const versions = (history[req.params.id] || []).map(v => ({
+ savedAt: v.savedAt,
+ reason: v.reason,
+ by: v.by,
+ data: toPublicRka(v.data)
+ }));
+ res.json({ id: req.params.id, versions });
+ } catch (error) {
+ console.error('Error fetching RKA history:', error);
+ res.status(500).json({ error: 'Gagal mengambil riwayat versi dokumen.' });
+ }
+});
+
+// ── ENDPOINT: Pulihkan dokumen RKA ke salah satu versi sebelumnya ──
+// :index 0 = versi paling baru yang tersimpan sebelum perubahan terakhir.
+app.post('/api/v1/rkis/:id/history/:index/restore', requireAuth, async (req, res) => {
+ try {
+ const { id, index } = req.params;
+ const history = await readHistoryStore();
+ const versions = history[id] || [];
+ const snapshot = versions[Number(index)];
+ if (!snapshot) return res.status(404).json({ error: 'Versi backup tidak ditemukan.' });
+
+ const db = await readDb();
+ const idx = db.rkis.findIndex(r => r.id === id);
+
+ if (idx !== -1 && req.user.role === 'user' && db.rkis[idx].userId && db.rkis[idx].userId !== req.user.id) {
+ return res.status(403).json({ error: 'Anda tidak memiliki izin memulihkan dokumen ini.' });
+ }
+ if (idx === -1 && req.user.role === 'user' && snapshot.data.userId && snapshot.data.userId !== req.user.id) {
+ return res.status(403).json({ error: 'Anda tidak memiliki izin memulihkan dokumen ini.' });
+ }
+
+ if (idx !== -1) {
+ // Simpan dulu versi yang SEKARANG sebelum ditimpa oleh versi lama, supaya tidak hilang.
+ await saveRkaSnapshot(id, db.rkis[idx], 'sebelum-dipulihkan', req.user.name || req.user.username);
+ db.rkis[idx] = { ...db.rkis[idx], ...snapshot.data };
+ } else {
+ // Dokumennya sudah tidak ada di arsip aktif (mis. sudah dihapus permanen dari sampah) — buat ulang dari snapshot.
+ db.rkis.unshift({ ...snapshot.data, id });
+ }
+ await writeDb(db);
+
+ await logActivity({
+ req,
+ action: 'RESTORE_RKA',
+ target: id,
+ details: `Dokumen RKA dipulihkan ke versi ${snapshot.savedAt} (${snapshot.reason})`
+ });
+
+ res.json(toPublicRka(idx !== -1 ? db.rkis[idx] : db.rkis[0]));
+ } catch (error) {
+ console.error('Error restoring RKA version:', error);
+ res.status(500).json({ error: 'Gagal memulihkan versi dokumen.' });
+ }
+});
+
+// ── ENDPOINT: Sampah — dokumen yang terhapus (satuan/massal), masih bisa dipulihkan ──
+// Sama seperti GET /api/v1/rkis: user hanya lihat miliknya, Admin & Moderator lihat semua.
+app.get('/api/v1/trash', requireAuth, async (req, res) => {
+ try {
+ let trash = await readTrashStore();
+ if (req.user.role === 'user') {
+ trash = trash.filter(t => !t.userId || t.userId === req.user.id);
+ }
+ res.json(trash.map(t => ({ ...toPublicRka(t), deletedAt: t.deletedAt, deletedBy: t.deletedBy })));
+ } catch (error) {
+ console.error('Error fetching trash:', error);
+ res.status(500).json({ error: 'Gagal mengambil data sampah.' });
+ }
+});
+
+// ── ENDPOINT: Pulihkan dokumen dari sampah kembali ke arsip aktif ──
+app.post('/api/v1/trash/:id/restore', requireAuth, async (req, res) => {
+ try {
+ const { id } = req.params;
+ const trash = await readTrashStore();
+ const tIdx = trash.findIndex(t => String(t.id) === String(id));
+ if (tIdx === -1) return res.status(404).json({ error: 'Dokumen tidak ditemukan di sampah.' });
+
+ const item = trash[tIdx];
+ if (req.user.role === 'user' && item.userId && item.userId !== req.user.id) {
+ return res.status(403).json({ error: 'Anda tidak memiliki izin memulihkan dokumen ini.' });
+ }
+
+ const { deletedAt, deletedBy, ...restored } = item;
+ trash.splice(tIdx, 1);
+ await setStore(RKA_TRASH_KEY, trash);
+
+ const db = await readDb();
+ const stillExists = db.rkis.some(r => String(r.id) === String(id));
+ if (!stillExists) db.rkis.unshift(restored);
+ await writeDb(db);
+
+ await logActivity({
+ req,
+ action: 'RESTORE_RKA',
+ target: id,
+ details: `Dokumen RKA dipulihkan dari sampah: ${restored.namaDokumen || id}`
+ });
+
+ res.json(toPublicRka(restored));
+ } catch (error) {
+ console.error('Error restoring from trash:', error);
+ res.status(500).json({ error: 'Gagal memulihkan dokumen dari sampah.' });
+ }
+});
+
+// ── ENDPOINT: Hapus permanen dari sampah (hanya Admin) ──
+app.delete('/api/v1/trash/:id', requireAuth, requireRole('admin'), async (req, res) => {
+ try {
+ const trash = await readTrashStore();
+ const filtered = trash.filter(t => String(t.id) !== String(req.params.id));
+ await setStore(RKA_TRASH_KEY, filtered);
+ await logActivity({
+ req,
+ action: 'DELETE_RKA',
+ target: req.params.id,
+ details: `Dokumen dihapus permanen dari sampah: ${req.params.id}`
+ });
+ res.json({ success: true });
+ } catch (error) {
+ console.error('Error purging trash item:', error);
+ res.status(500).json({ error: 'Gagal menghapus permanen dari sampah.' });
  }
 });
 
