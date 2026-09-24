@@ -17,6 +17,21 @@
 const POLL_INTERVAL_ACTIVE = Math.max(3000, Number(process.env.REALTIME_POLL_MS) || 10000);
 const POLL_DISABLED = String(process.env.REALTIME_DB_POLL || '').toLowerCase() === 'off';
 
+// Teks mentah PDF (sourceText dkk.) besar dan tidak perlu dikirim ke klien lewat SSE;
+// klien cukup tahu apakah teksnya tersedia (hasSourceText) untuk tombol "Generate Ulang AI".
+const RAW_TEXT_FIELDS = ['sourceText', '_rawText', 'rawPdfText', 'rawText', 'originalText', 'extractedText'];
+const toClientRka = (rka) => {
+  if (!rka || typeof rka !== 'object') return rka;
+  const copy = { ...rka };
+  let has = false;
+  for (const f of RAW_TEXT_FIELDS) {
+    if (typeof copy[f] === 'string' && copy[f].trim().length > 100) has = true;
+    delete copy[f];
+  }
+  copy.hasSourceText = has;
+  return copy;
+};
+
 const toStateMap = (db) => new Map((db?.rkis || []).filter(r => r?.id).map(r => [String(r.id), r]));
 
 // Filter penerima: pemilik dokumen, admin, dan moderator. Dokumen lama tanpa userId terlihat semua.
@@ -117,9 +132,9 @@ class RealtimeHub {
     for (const [id, rka] of next.entries()) {
       const previous = this.lastRkiState.get(id);
       if (!previous) {
-        this.broadcast('RKA_CREATED', rka, visibleTo(rka));
+        this.broadcast('RKA_CREATED', toClientRka(rka), visibleTo(rka));
       } else if (JSON.stringify(previous) !== JSON.stringify(rka)) {
-        this.broadcast('RKA_UPDATED', rka, visibleTo(rka));
+        this.broadcast('RKA_UPDATED', toClientRka(rka), visibleTo(rka));
       }
     }
 

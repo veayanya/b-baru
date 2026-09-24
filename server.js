@@ -811,31 +811,59 @@ PENTING: Output HARUS berupa JSON valid murni SAJA — JANGAN tambahkan kalimat 
  }
 });
 
-app.post('/api/v1/evaluate', requireAuth, async (req, res) => {
- try {
- const { text, rules, tahun } = req.body;
- // API Key diambil dari .env (backend), bukan dari header/frontend
- const geminiApiKey = process.env.GEMINI_API_KEY || req.headers['x-api-key'];
+// ── Helper: teks sumber PDF RKA ─────────────────────────────────────────────
+// Ekstraksi PDF kadang menghasilkan blok teks panjang yang terulang persis
+// (mis. isi halaman yang sama tertulis 3x). Blok duplikat dibuang agar tidak
+// memakan batas 30.000 karakter konteks AI dan tidak mengacaukan analisis.
+const RKA_SOURCE_TEXT_MAX = 30000;
+const RKA_RAW_FIELDS = ['sourceText', '_rawText', 'rawPdfText', 'rawText', 'originalText', 'extractedText'];
 
- if (!text || typeof text !== 'string' || text.trim().length === 0) {
- await logActivity({
- req,
- action: 'UPLOAD_RKA',
- target: req.body?.fileName || 'Dokumen RKA',
- details: 'Gagal memproses berkas RKA: Teks dokumen kosong atau tidak dapat diekstrak.',
- status: 'FAILED'
- });
- return res.status(400).json({ error: 'Text dari PDF RKA tidak ditemukan atau dokumen kosong.' });
+function cleanRkaText(input) {
+ const text = String(input || '').replace(/\r\n?/g, '\n');
+ const seen = new Set();
+ const out = [];
+ for (const block of text.split(/\n+/)) {
+  const norm = block.replace(/\s+/g, ' ').trim();
+  if (!norm) continue;
+  if (norm.length >= 200) {
+   if (seen.has(norm)) continue; // blok panjang identik → buang
+   seen.add(norm);
+  }
+  out.push(norm);
  }
+ return out.join('\n');
+}
 
- if (!geminiApiKey) {
- console.log('[Evaluate] GEMINI_API_KEY belum diset, menggunakan Smart Heuristic Evaluator...');
- const fallbackResult = parseRkaHeuristic(text, 'Dokumen RKA.pdf', rules);
- return res.json(fallbackResult);
+// Ambil teks sumber PDF yang tersimpan pada dokumen RKA (field baru maupun lama).
+function getRkaSourceText(rka) {
+ for (const f of RKA_RAW_FIELDS) {
+  if (typeof rka?.[f] === 'string' && rka[f].trim().length > 100) return rka[f];
  }
+ return '';
+}
 
- const genAIInstance = new GoogleGenerativeAI(geminiApiKey);
+// Buang teks mentah dari objek (respons daftar, snapshot versi) — teks ini besar.
+function stripRkaRawText(obj) {
+ const copy = { ...obj };
+ for (const f of RKA_RAW_FIELDS) delete copy[f];
+ return copy;
+}
 
+// Bentuk dokumen RKA untuk klien: tanpa teks mentah, dengan penanda hasSourceText.
+function toPublicRka(rka) {
+ return { ...stripRkaRawText(rka), hasSourceText: !!getRkaSourceText(rka) };
+}
+
+// Sertakan teks sumber (sudah dibersihkan & dibatasi) pada hasil analisis agar
+// dokumen yang tersimpan bisa di-generate ulang tanpa unggah PDF lagi.
+function withSourceText(result, text) {
+ if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+ return { ...result, sourceText: cleanRkaText(text).slice(0, RKA_SOURCE_TEXT_MAX) };
+}
+
+// ── Helper: susun prompt evaluasi RKA (dipakai /evaluate & /rkis/:id/regenerate) ──
+async function buildEvaluationPrompt({ text: rawTextInput, rules, tahun }) {
+ const text = cleanRkaText(rawTextInput);
  let rulesText = 'Tidak ada aturan khusus.';
  if (rules && rules.length > 0) {
  rulesText = rules.map((r, i) => `${i + 1}. ${r.name}: ${r.desc}`).join('\n');
@@ -1005,23 +1033,53 @@ PENTING: Output Anda HARUS murni berupa valid JSON SAJA tanpa markdown \`\`\`jso
 }
 `;
 
+ return prompt;
+}
+
+
+app.post('/api/v1/evaluate', requireAuth, async (req, res) => {
+ try {
+ const { text, rules, tahun } = req.body;
+ // API Key diambil dari .env (backend), bukan dari header/frontend
+ const geminiApiKey = process.env.GEMINI_API_KEY || req.headers['x-api-key'];
+
+ if (!text || typeof text !== 'string' || text.trim().length === 0) {
+ await logActivity({
+ req,
+ action: 'UPLOAD_RKA',
+ target: req.body?.fileName || 'Dokumen RKA',
+ details: 'Gagal memproses berkas RKA: Teks dokumen kosong atau tidak dapat diekstrak.',
+ status: 'FAILED'
+ });
+ return res.status(400).json({ error: 'Text dari PDF RKA tidak ditemukan atau dokumen kosong.' });
+ }
+
+ if (!geminiApiKey) {
+ console.log('[Evaluate] GEMINI_API_KEY belum diset, menggunakan Smart Heuristic Evaluator...');
+ const fallbackResult = parseRkaHeuristic(text, 'Dokumen RKA.pdf', rules);
+ return res.json(withSourceText(fallbackResult, text));
+ }
+
+ const genAIInstance = new GoogleGenerativeAI(geminiApiKey);
+
+ const prompt = await buildEvaluationPrompt({ text, rules, tahun });
  try {
  console.log("Sending prompt to Gemini...");
  const result = await generateContentWithFallback(genAIInstance, geminiApiKey, prompt);
  const response = await result.response;
  const jsonOutput = parseAiJson(response.text());
- res.json(jsonOutput);
+ res.json(withSourceText(jsonOutput, text));
  } catch (aiCallError) {
  console.warn("[Evaluate] Gemini AI error, beralih ke Fallback Heuristic Evaluator:", aiCallError.message);
  const fallbackResult = parseRkaHeuristic(text, 'Dokumen RKA.pdf', rules);
- res.json(fallbackResult);
+ res.json(withSourceText(fallbackResult, text));
  }
 
  } catch (error) {
  console.error("Error from AI evaluation:", error);
  try {
  const fallbackResult = parseRkaHeuristic(req.body?.text, 'Dokumen RKA.pdf', req.body?.rules);
- res.json(fallbackResult);
+ res.json(withSourceText(fallbackResult, req.body?.text));
  } catch (finalErr) {
  await logActivity({
  req,
@@ -1051,7 +1109,7 @@ app.get('/api/v1/rkis', requireAuth, async (req, res) => {
  if (isServingFallbackData()) {
  res.set('X-Data-Source', 'cadangan-lokal');
  }
- res.json(rkis);
+ res.json(rkis.map(toPublicRka));
  } catch (error) {
  console.error("Error fetching RKIs:", error);
  res.status(500).json({
@@ -1080,6 +1138,11 @@ app.post('/api/v1/rkis', requireAuth, async (req, res) => {
  clientIp,
  clientDevice
  };
+ // Teks mentah PDF disimpan di satu field standar (sourceText) agar bisa dipakai
+ // tombol "Generate Ulang AI"; field-field lama dinormalisasi ke sini.
+ const incomingText = getRkaSourceText(req.body);
+ for (const f of RKA_RAW_FIELDS) delete newRka[f];
+ if (incomingText) newRka.sourceText = cleanRkaText(incomingText).slice(0, RKA_SOURCE_TEXT_MAX);
  db.rkis.unshift(newRka);
  await writeDb(db);
 
@@ -1092,7 +1155,7 @@ app.post('/api/v1/rkis', requireAuth, async (req, res) => {
  status: 'SUCCESS'
  });
 
- res.status(201).json(newRka);
+ res.status(201).json(toPublicRka(newRka));
  } catch (error) {
  console.error("Error saving RKA:", error);
  try {
@@ -1123,7 +1186,8 @@ app.put('/api/v1/rkis/:id', requireAuth, async (req, res) => {
  return res.status(403).json({ error: 'Anda tidak memiliki izin mengubah dokumen ini.' });
  }
 
- db.rkis[idx] = { ...rka, ...updates };
+ const safeUpdates = stripRkaRawText(updates || {}); // teks sumber hanya diubah server
+ db.rkis[idx] = { ...rka, ...safeUpdates };
  await writeDb(db);
 
  await logActivity({
@@ -1133,7 +1197,7 @@ app.put('/api/v1/rkis/:id', requireAuth, async (req, res) => {
  details: `Pembaruan data/status RKA: ${updates.status || 'Updated'}`
  });
 
- res.json(db.rkis[idx]);
+ res.json(toPublicRka(db.rkis[idx]));
  } catch (error) {
  console.error("Error updating RKA:", error);
  res.status(500).json({ error: 'Gagal memperbarui data RKA' });
@@ -1213,6 +1277,128 @@ app.post('/api/v1/rkis/bulk-delete', requireAuth, async (req, res) => {
  } catch (error) {
  console.error('Error bulk-deleting RKA:', error);
  res.status(500).json({ error: 'Gagal menghapus dokumen RKA' });
+ }
+});
+
+// ── ENDPOINT: Generate ulang analisis AI dari teks PDF yang sudah tersimpan ──
+// Dipakai tombol "Generate Ulang AI" — pengguna TIDAK perlu unggah PDF lagi.
+// • Memakai sourceText yang tersimpan saat unggah (fallback: body.text bila dikirim klien).
+// • Hanya memakai AI. Bila AI gagal/kuota habis, dokumen lama TIDAK ditimpa
+//   (tidak jatuh ke heuristic agar hasil bagus tidak diganti hasil yang lebih buruk).
+// • Hasil disimpan sebagai versi baru (bisa dikembalikan lewat riwayat versi).
+const REGEN_PRESERVE_FIELDS = new Set([
+ 'id', 'userId', 'createdBy', 'clientIp', 'clientDevice', 'namaDokumen', 'fileName',
+ 'tanggalUpload', 'createdAt', 'uploadedAt', 'tanggalUpload', 'status',
+ 'versions', 'auditLogs', 'activeVersionId', 'selectedVersionName', 'hasSourceText',
+ ...RKA_RAW_FIELDS
+]);
+
+app.post('/api/v1/rkis/:id/regenerate', requireAuth, async (req, res) => {
+ const { id } = req.params;
+ try {
+  const db = await readDb();
+  const rka = db.rkis.find(r => String(r.id) === String(id));
+  if (!rka) return res.status(404).json({ error: 'Dokumen RKA tidak ditemukan.' });
+
+  if (req.user.role === 'user' && rka.userId && rka.userId !== req.user.id) {
+   return res.status(403).json({ error: 'Anda tidak memiliki izin mengubah dokumen ini.' });
+  }
+
+  const storedText = getRkaSourceText(rka);
+  const bodyText = typeof req.body?.text === 'string' ? req.body.text : '';
+  const sourceText = storedText || bodyText;
+  if (!sourceText || sourceText.trim().length < 100) {
+   return res.status(409).json({
+    code: 'SOURCE_TEXT_MISSING',
+    error: 'Teks PDF dokumen ini tidak tersimpan (dokumen lama). Unggah ulang PDF sekali saja agar tombol Generate Ulang AI bisa dipakai.'
+   });
+  }
+
+  const rules = Array.isArray(req.body?.rules) ? req.body.rules : [];
+  const tahun = req.body?.tahun || rka.tahun_rencana;
+  const geminiApiKey = process.env.GEMINI_API_KEY || req.headers['x-api-key'];
+
+  const prompt = await buildEvaluationPrompt({ text: sourceText, rules, tahun });
+
+  let aiResult;
+  try {
+   console.log(`[Regenerate] Mengirim ulang teks tersimpan dokumen ${id} ke Gemini...`);
+   const genAIInstance = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
+   const result = await generateContentWithFallback(genAIInstance, geminiApiKey, prompt);
+   const response = await result.response;
+   aiResult = parseAiJson(response.text());
+  } catch (aiErr) {
+   console.warn('[Regenerate] Gemini gagal:', aiErr.message);
+   await logActivity({ req, action: 'REGENERATE_RKA', target: id, status: 'FAILED',
+    details: `Generate ulang AI gagal: ${aiErr.message}` });
+   return res.status(502).json({ error: 'AI belum bisa memproses saat ini: ' + aiErr.message + '. Data lama tidak diubah, silakan coba lagi.' });
+  }
+
+  if (!aiResult || typeof aiResult !== 'object' || Array.isArray(aiResult) ||
+      (aiResult.pagu === undefined && aiResult.sroi_ratio === undefined)) {
+   await logActivity({ req, action: 'REGENERATE_RKA', target: id, status: 'FAILED',
+    details: 'Generate ulang AI menghasilkan format tidak valid.' });
+   return res.status(502).json({ error: 'Respons AI tidak valid. Data lama tidak diubah, silakan coba lagi.' });
+  }
+
+  const now = new Date().toISOString();
+
+  // Pastikan ada versi awal sebelum menambah versi hasil generate ulang.
+  if (!Array.isArray(rka.versions)) {
+   const originalCopy = JSON.parse(JSON.stringify(stripRkaRawText(rka)));
+   delete originalCopy.versions;
+   delete originalCopy.auditLogs;
+   rka.versions = [{
+    versionId: 'v1.0', version: 'v1.0', parent_version_id: 'v1.0',
+    timestamp: rka.tanggalUpload || now, createdAt: rka.tanggalUpload || now,
+    source: 'initial', createdBy: 'AI Extractor',
+    changesSummary: 'Hasil analisis draf RKA pertama kali diekstrak dari PDF.',
+    data: originalCopy
+   }];
+  }
+
+  const parentVer = rka.activeVersionId || 'v1.0';
+  const nextVerId = `v1.${rka.versions.length}`;
+  const aiFields = {};
+  for (const [k, v] of Object.entries(aiResult)) {
+   if (!REGEN_PRESERVE_FIELDS.has(k)) aiFields[k] = v;
+  }
+
+  Object.assign(rka, aiFields);
+  const actor = req.user.name || req.user.username || 'Pengguna';
+  const newVersion = {
+   versionId: nextVerId, version: nextVerId, parent_version_id: parentVer,
+   timestamp: now, createdAt: now, source: 'regenerate-ai',
+   versionName: `${nextVerId} (Generate Ulang AI)`,
+   createdBy: actor,
+   changesSummary: 'Analisis AI dijalankan ulang dari teks PDF yang tersimpan (tanpa unggah ulang).',
+   modifications: [],
+   data: { ...stripRkaRawText(aiFields), id: rka.id }
+  };
+  rka.versions.push(newVersion);
+  rka.activeVersionId = nextVerId;
+  rka.selectedVersionName = newVersion.versionName;
+  rka.lastRegeneratedAt = now;
+
+  // Simpan teks sumber yang sudah dibersihkan (bila sebelumnya dari body klien).
+  if (!storedText) rka.sourceText = cleanRkaText(sourceText).slice(0, RKA_SOURCE_TEXT_MAX);
+
+  if (!Array.isArray(rka.auditLogs)) rka.auditLogs = [];
+  rka.auditLogs.unshift({
+   id: 'log-' + Date.now(), timestamp: now, actor,
+   action: 'REGENERATE_AI', versionId: nextVerId, versionName: newVersion.versionName,
+   parent_version_id: parentVer, source: 'regenerate-ai',
+   details: newVersion.changesSummary, modifications: []
+  });
+
+  await writeDb(db);
+  await logActivity({ req, action: 'REGENERATE_RKA', target: id,
+   details: `Generate ulang AI berhasil untuk ${rka.namaDokumen || rka.sub_kegiatan || id} → ${nextVerId}` });
+
+  res.json({ success: true, version: newVersion, rka: toPublicRka(rka) });
+ } catch (error) {
+  console.error('Error regenerating RKA:', error);
+  res.status(500).json({ error: 'Gagal generate ulang analisis: ' + error.message });
  }
 });
 
@@ -1349,11 +1535,12 @@ app.post('/api/v1/rkis/:id/versions', requireAuth, async (req, res) => {
   createdBy: _ignoredCreatedBy,
   clientIp: _ignoredClientIp,
   clientDevice: _ignoredClientDevice,
-  ...cleanData
+  ...cleanDataRaw
  } = data;
+ const cleanData = stripRkaRawText(cleanDataRaw);
 
  if (!Array.isArray(rkaItem.versions)) {
- const originalCopy = JSON.parse(JSON.stringify(rkaItem));
+ const originalCopy = JSON.parse(JSON.stringify(stripRkaRawText(rkaItem)));
  delete originalCopy.versions;
  delete originalCopy.auditLogs;
  rkaItem.versions = [{
